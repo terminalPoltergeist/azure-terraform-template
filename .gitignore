@@ -1,0 +1,6 @@
+notes.md
+DEVELOPMENT.md
+.marksman.toml
+
+.terraform*
+*.tfstate*

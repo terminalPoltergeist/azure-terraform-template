@@ -1,0 +1,257 @@
+name: "Integration"
+
+on:
+  pull_request:
+    paths:
+      - 'modules/**'
+      - '**.tf'
+env:
+  TF_CLI_ARGS_init: "-backend-config=storage_account_name=${{ secrets.STATE_STORAGE_ACCOUNT }} -backend-config=resource_group_name=${{ secrets.STATE_RESOURCE_GROUP }} -backend-config=container_name=${{ secrets.STATE_CONTAINER_NAME }} -backend-config=key=${{ secrets.STATE_FILE }}"
+  ARM_SUBSCRIPTION_ID: ${{secrets.AZURE_SUBSCRIPTION_ID}}
+  ARM_CLIENT_ID: ${{secrets.AZURE_CLIENT_ID}}
+  ARM_TENANT_ID: ${{secrets.AZURE_TENANT_ID}}
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v2
+        with:
+          node-version: '20'
+
+      # - name: Get changes
+      #   run: |
+      #     echo ${{ github.event.pull_request.head.sha }}
+      #     echo ${{ github.event.pull_request.base.sha }}
+      #     echo ${{ github.event.pull_request.base.ref }}
+      #     dirs=$(g diff ${{ github.event.pull_request.head.sha }} ${{ github.event.pull_request.base.sha }} --name-only \
+      #             | grep -E -w ".*\.tf|.*\.tfvars" | rev | cut -d "/" -f 2- | rev | sort | uniq)
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ~1.9.8
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -check -no-color
+        continue-on-error: true
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -no-color ${{ env.TF_CLI_ARGS_init }}
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: tf_plan
+        run: |
+          terraform plan -input=false -no-color -out=tfplan > /dev/null \
+          && terraform show -no-color tfplan
+        continue-on-error: true
+
+      - name: Create plan.json
+        if: steps.tf_plan.outcome == 'success'
+        id: tf_json
+        run: |
+          terraform show -no-color -json tfplan > plan.json
+        continue-on-error: true
+
+      - name: Upload plan file
+        id: artifact
+        if: ${{ hashFiles('tfplan') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: ./tfplan
+          retention-days: 1
+
+      - name: Filter plan
+        if: steps.tf_json.outcome == 'success'
+        id: filter-plan
+        uses: actions/github-script@v7
+        with:
+          script: |
+            var create = 0;
+            var update = 0;
+            var destroy = 0;
+            var noop = 0;
+            var read = 0;
+
+            const plan = require('./plan.json')
+
+            plan.resource_changes.forEach(data => {
+              if (data.change.actions.includes("create")) create++;
+              if (data.change.actions.includes("update")) update++;
+              if (data.change.actions.includes("delete")) destroy++;
+              if (data.change.actions.includes("noop"))  noop++;
+              if (data.change.actions.includes("read"))  read++;
+            })
+
+            const fs = require("fs")
+
+            var changes = `+ create: ${create}
+            - delete: ${destroy}
+            ~ update: ${update}
+            # read: ${read}
+            = no-op: ${noop}`
+
+            fs.writeFile("changes.txt", changes, (err) => {
+              if (err) console.log(err);
+            })
+
+      - name: Format plan
+        if: steps.filter-plan.outcome == 'success'
+        id: format-plan
+        run: |
+          PLAN_MAX_CHAR_COUNT=65000
+
+          plan=$(cat <<'EOF'
+          ${{ format('{0}{1}', steps.tf_plan.outputs.stdout, steps.tf_plan.outputs.stderr) }}
+          EOF
+          )
+
+          if (( ${#plan} > PLAN_MAX_CHAR_COUNT )); then
+            # plan size is nearly too large to post in pr comment
+            echo "PLAN<<EOF" >> $GITHUB_ENV
+            echo "WARN: Plan size is too large. This is only a summary." >> $GITHUB_ENV
+            echo "To view the full plan, download the planfile and run 'terraform show <planfile>'\n" >> $GITHUB_ENV
+            echo "$(cat changes.txt)" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          else
+            # plan size is small enough to put in pr comment
+            echo "PLAN<<EOF" >> $GITHUB_ENV
+            echo "${plan}" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          fi
+
+      - name: Update Pull Request
+        # this step can use https://octokit.github.io/rest.js/v21/
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // graphql query that retrieves a list of the last 100 comments on the pr
+            const commentsQuery = `query ($owner: String!, $repo: String!, $pr: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $pr) {
+                  comments(last: 100, orderBy: { field: UPDATED_AT, direction: DESC }) {
+                    nodes {
+                      # Use this as subjectId
+                      id
+                      author { login }
+                      viewerCanMinimize
+                      body
+                    }
+                  }
+                }
+              }
+            }`
+
+            const commentsVars = {
+              owner: '${{ github.repository_owner }}',
+              repo: '${{ github.event.repository.name }}',
+              pr: ${{ github.event.pull_request.number }}
+            }
+
+            // run the above query
+            github.graphql(commentsQuery, commentsVars).then((result) => {
+              // filter comments that were made by the github-actions bot, can be minimized, and are probably a ci comment
+              var comments = result.repository.pullRequest.comments.nodes.filter(c => {
+                return c.author.login == 'github-actions' && c.viewerCanMinimize && c.body.includes("Integration")
+              })
+
+              // graphql mutation query to minimize a comment
+              const minimizeMutation = `mutation minimizeComment($id: ID!) {
+                minimizeComment(input: { classifier: OUTDATED, subjectId: $id }) {
+                  clientMutationId
+                  }
+                }`
+
+              // minimize each matched comment
+              comments.forEach(c => {
+                github.graphql(minimizeMutation, {id: c.id})
+              })
+            })
+
+
+            const formatResults = `<details><summary>Format Output</summary>
+
+            \`\`\`\n
+            ${{ join(steps.fmt.outputs.*, '') }}
+            \`\`\`
+
+            </details>`
+
+            const initResults = `<details><summary>Initialization Output</summary>
+
+            \`\`\`\n
+            ${{ join(steps.init.outputs.*, '') }}
+            \`\`\`
+
+            </details>`
+
+            const lintResults = `<details><summary>Linting Output</summary>
+
+            \`\`\`\n
+            ${{ join(steps.validate.outputs.*, '') }}
+            \`\`\`
+
+            </details>`
+
+            const planResults = `<details><summary>Plan</summary>
+
+            \`\`\`\n
+            ${{ env.PLAN }}
+            \`\`\`
+
+            </details>`
+
+            const output = `#### Formatting: ${{ steps.fmt.outcome == 'success' && '✅ Succeeded' || '🚨 Failed' }}
+
+            ${{ steps.fmt.outcome == 'success' && '\n' || '${formatResults}' }}
+
+            #### Initialization: ${{ steps.init.outcome == 'success' && '✅ Succeeded' || '🚨 Failed' }}
+
+            ${{ steps.init.outcome == 'success' && '\n' || '${initResults}' }}
+
+            #### Linting: ${{ steps.validate.outcome == 'success' && '✅ Succeeded' || '🚨 Failed' }}
+
+            ${{ steps.validate.outcome == 'success' &&  '\n' || '${lintResults}' }}
+
+            #### Integration: ${{ steps.tf_plan.outcome == 'success' && '✅ Succeeded' || '🚨 Failed' }}
+
+            [Download Plan File](${{ steps.artifact.outputs.artifact-url }})
+
+            ${planResults}
+
+            *Author: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terraform Plan Status
+        if: steps.tf_plan.outcome == 'failure'
+        run: exit 1

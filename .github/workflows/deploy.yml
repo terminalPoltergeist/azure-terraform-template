@@ -1,0 +1,243 @@
+name: "Deploy"
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'modules/**'
+      - '**.tf'
+
+env:
+  TF_CLI_ARGS_init: "-backend-config=storage_account_name=${{ secrets.STATE_STORAGE_ACCOUNT }} -backend-config=resource_group_name=${{ secrets.STATE_RESOURCE_GROUP }} -backend-config=container_name=${{ secrets.STATE_CONTAINER_NAME }} -backend-config=key=${{ secrets.STATE_FILE }}"
+  TF_CLI_ARGS_lock_init: "-backend-config=storage_account_name=${{ secrets.STATE_STORAGE_ACCOUNT }} -backend-config=resource_group_name=${{ secrets.STATE_RESOURCE_GROUP }} -backend-config=container_name=${{ secrets.STATE_CONTAINER_NAME }} -backend-config=key=locks.tfstate"
+  TF_CLI_ARGS_apply: "-auto-approve -parallelism=30 -input=false -no-color"
+  ARM_SUBSCRIPTION_ID: ${{secrets.AZURE_SUBSCRIPTION_ID}}
+  ARM_CLIENT_ID: ${{secrets.AZURE_CLIENT_ID}}
+  ARM_TENANT_ID: ${{secrets.AZURE_TENANT_ID}}
+
+permissions:
+  id-token: write   # needed for federated auth
+  contents: read
+
+jobs:
+  remove-locks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v2
+        with:
+          node-version: '20'
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ~1.9.8
+
+      # Need to init with the main backend state first to pull the resource ids to lock
+      # Then reconfigure backend to the locks.tfstate state file to remove locks
+
+      - name: Terraform Init
+        run: terraform init -no-color ${{ env.TF_CLI_ARGS_init }}
+        continue-on-error: true
+
+      - name: Save lock ids
+        id: locks
+        run: terraform output -no-color -json > locks.json
+
+      # - name: Get locks
+      #   id: locks
+      #   run: echo "tf_outputs=$(terraform output -no-color -json)" >> $GITHUB_OUTPUT
+
+      - name: Filter locks
+        id: filtered
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const fs = require('fs')
+
+            const data = fs.readFileSync('./locks.json', 'utf8')
+
+            console.log(data)
+
+            const outputs = JSON.parse(data)
+
+            if (Object.keys(outputs).length == 0) {
+              // no outputs
+              return 1
+            }
+
+            const lockNames = Object.keys(outputs).filter((key) => {
+              return key.includes("dolock_")
+            })
+
+            if (Object.keys(lockNames).length == 0) {
+              // no locks
+              return 1
+            }
+
+            var lockIds = []
+
+            lockNames.forEach((name) => {
+              lockIds.push(outputs[name].value)
+            })
+
+            return JSON.stringify(lockIds)
+
+      - name: Terraform Init
+        id: init
+        if: steps.filtered.outputs.result != 1
+        working-directory: ./utils/resource-lock
+        run: terraform init -reconfigure -no-color ${{ env.TF_CLI_ARGS_lock_init }}
+        continue-on-error: true
+
+      - name: TF destroy
+        if: steps.init.outcome == 'success'
+        id: destroy
+        working-directory: ./utils/resource-lock
+        run: terraform destroy -var 'resource_ids=${{ steps.filtered.outputs.result }}' ${{ env.TF_CLI_ARGS_apply }}
+
+  cd:
+    runs-on: ubuntu-latest 
+    needs: remove-locks
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v2
+        with:
+          node-version: '20'
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # - name: Azure CLI script
+      #   uses: azure/cli@v2
+      #   with:
+      #     azcliversion: latest
+      #     inlineScript: az account show
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ~1.9.8
+
+      - name: Terraform Init
+        id: init
+        run: terraform init -no-color ${{ env.TF_CLI_ARGS_init }}
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: tf_plan
+        run: |
+          # silence stdout for plan, redirect stderr to stdout
+          terraform plan -input=false -no-color > /dev/null 2>&1
+        continue-on-error: false
+
+      - name: Terraform Apply
+        if: ( !contains(join(steps.run.tf_plan.outputs.*, ''), 'No changes. Your infrastructure matches the configuration.') )
+        run: terraform apply ${{ env.TF_CLI_ARGS_apply }}
+
+      - name: Save lock ids
+        id: locks
+        run: terraform output -no-color -json > locks.json
+
+      - name: Save lock file
+        uses: actions/upload-artifact@v4
+        with:
+          name: locks
+          path: ./locks.json
+          retention-days: 1
+
+    outputs:
+      tf_outputs: ${{ steps.locks.outputs.tf_outputs }}
+
+  apply-locks:
+    runs-on: ubuntu-latest 
+    needs: cd
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v2
+        with:
+          node-version: '20'
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ~1.9.8
+
+      - name: Terraform Init
+        id: init
+        working-directory: ./utils/resource-lock
+        run: terraform init -no-color ${{ env.TF_CLI_ARGS_lock_init }}
+        continue-on-error: false
+
+      # - name: Get locks
+      #   id: locks
+      #   run: echo "tf_outputs=$(terraform output -no-color -json)" >> $GITHUB_OUTPUT
+
+      - name: Download locks.json artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: locks
+          path: ./
+
+      - name: Filter locks
+        id: filtered
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const fs = require('fs')
+
+            const data = fs.readFileSync('./locks.json', 'utf8')
+
+            console.log(data)
+
+            const outputs = JSON.parse(data)
+
+            if (Object.keys(outputs).length == 0) {
+              // no outputs
+              return 1
+            }
+
+            const lockNames = Object.keys(outputs).filter((key) => {
+              return key.includes("dolock_")
+            })
+
+            if (Object.keys(lockNames).length == 0) {
+              // no locks
+              return 1
+            }
+
+            var lockIds = []
+
+            lockNames.forEach((name) => {
+              lockIds.push(outputs[name].value)
+            })
+
+            return JSON.stringify(lockIds)
+
+      - name: TF apply
+        id: apply
+        if: steps.filtered.outputs.result != 1
+        working-directory: ./utils/resource-lock
+        run: terraform apply -var 'resource_ids=${{ steps.filtered.outputs.result }}' ${{ env.TF_CLI_ARGS_apply }}
